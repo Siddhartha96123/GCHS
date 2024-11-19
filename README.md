@@ -45,7 +45,12 @@ To use GCHS, ensure you have the following installed:
 
 ### Structural Alignment:
 
-Distance Calculation: Computes the Euclidean distances between corresponding C-alpha atoms in aligned structures.
+- Distance Calculation: Computes the Euclidean distances between corresponding C-alpha atoms in aligned structures.
+- Data Recording: Record the calculated distances in excel format.
+
+### Visualization: 
+
+Matplot used to plot the recorded distances against the correspondingly aligned residue ID of the Target PDB. 
 
 ## Output:
 
