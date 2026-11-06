@@ -1,0 +1,625 @@
+# GCHS v2.1 — FROZEN TRACK-A BUILD
+# General Executable Conformational Heterogeneity Scanner
+# Author: Siddhartha Mishra
+#
+# Generic workflow:
+# PDB 1 -> select chain -> PDB 2 -> select chain ->
+# BLOSUM62 alignment -> residue mapping -> C-alpha superposition ->
+# per-residue C-alpha displacement -> all-atom averaged B-factors ->
+# Master Log + alignment + two plots.
+#
+# GCHS does NOT assume whether the comparison is apo/ligand-bound,
+# orthologous, same-organism, different-organism, etc. That is for
+# the user to determine.
+
+!pip install -q biopython pandas openpyxl matplotlib ipywidgets
+
+from Bio.PDB import PDBParser, Superimposer, is_aa
+from Bio.Align import PairwiseAligner, substitution_matrices
+from Bio.SeqUtils import seq1
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from google.colab import files
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import os, re, warnings
+
+warnings.filterwarnings("ignore")
+
+GCHS_VERSION = "2.1"
+MIN_ALIGNED_RESIDUES = 5
+IDENTITY_WARNING = 0.30
+
+
+class GCHSError(Exception):
+    pass
+
+
+# ----------------------------- FILES -----------------------------
+
+def upload_single_pdb(prompt):
+    print(prompt)
+    uploaded = files.upload()
+    if not uploaded:
+        raise GCHSError("No file was uploaded.")
+    if len(uploaded) != 1:
+        raise GCHSError("Please upload exactly one PDB file at a time.")
+
+    path = list(uploaded.keys())[0]
+
+    if not os.path.exists(path):
+        raise GCHSError(f"Uploaded file '{path}' could not be found.")
+    if os.path.getsize(path) == 0:
+        raise GCHSError(f"Uploaded file '{path}' is empty.")
+
+    if not path.lower().endswith((".pdb", ".ent")):
+        print(f"Warning: '{path}' does not have a .pdb/.ent extension.")
+
+    return path
+
+
+def parse_structure(path, label):
+    try:
+        structure = PDBParser(QUIET=True).get_structure(label, path)
+    except Exception as e:
+        raise GCHSError(f"Could not parse {label} PDB '{path}': {e}")
+
+    if len(structure) == 0 or len(structure[0]) == 0:
+        raise GCHSError(f"No usable model/chains found in '{path}'.")
+
+    return structure
+
+
+def chain_ids(structure):
+    return [c.id for c in structure[0]]
+
+
+def safe_stem(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", stem)
+
+
+# ------------------------ CHAIN DATA -----------------------------
+
+def extract_chain_data(structure, chain_id, label):
+    model = structure[0]
+
+    if chain_id not in model.child_dict:
+        raise GCHSError(
+            f"Chain '{chain_id}' is not present in {label}. "
+            f"Available chains: {', '.join(chain_ids(structure))}"
+        )
+
+    sequence, residues, b_factors = [], [], []
+
+    for residue in model[chain_id]:
+        if not is_aa(residue, standard=True):
+            continue
+
+        try:
+            aa = seq1(residue.get_resname())
+        except Exception:
+            continue
+
+        sequence.append(aa)
+        residues.append(residue)
+
+        vals = [
+            atom.get_bfactor()
+            for atom in residue
+            if atom.get_bfactor() is not None
+        ]
+        b_factors.append(float(np.mean(vals)) if vals else np.nan)
+
+    sequence = "".join(sequence)
+
+    if not sequence:
+        raise GCHSError(
+            f"No standard amino-acid residues found in "
+            f"{label}, chain {chain_id}."
+        )
+
+    return sequence, residues, b_factors
+
+
+# ------------------------- ALIGNMENT ------------------------------
+
+def align_sequences(seq_ref, seq_target):
+    aligner = PairwiseAligner()
+    aligner.mode = "global"
+    aligner.substitution_matrix = substitution_matrices.load("BLOSUM62")
+    aligner.open_gap_score = -11
+    aligner.extend_gap_score = -1
+
+    try:
+        best = aligner.align(seq_ref, seq_target)[0]
+    except Exception as e:
+        raise GCHSError(f"Sequence alignment failed: {e}")
+
+    aligned_ref = str(best[0])
+    aligned_target = str(best[1])
+
+    pairs = [
+        (a, b) for a, b in zip(aligned_ref, aligned_target)
+        if a != "-" and b != "-"
+    ]
+
+    if not pairs:
+        raise GCHSError("No aligned residue pairs were produced.")
+
+    identity = sum(a == b for a, b in pairs) / len(pairs)
+
+    print(f"Sequence identity: {identity * 100:.2f}%")
+
+    if identity < IDENTITY_WARNING:
+        print(
+            "WARNING: Sequence identity is below 30%. "
+            "Verify that the selected chains represent a meaningful "
+            "biological comparison."
+        )
+
+    return aligned_ref, aligned_target, identity
+
+
+# ----------------------- RESIDUE MAPPING --------------------------
+
+def map_residues(aligned_ref, aligned_target,
+                 ref_residues, tgt_residues,
+                 ref_b, tgt_b):
+
+    rr, tr, rb, tb = [], [], [], []
+    i = j = 0
+
+    for a, b in zip(aligned_ref, aligned_target):
+
+        if a != "-" and b != "-":
+            rr.append(ref_residues[i])
+            tr.append(tgt_residues[j])
+            rb.append(ref_b[i])
+            tb.append(tgt_b[j])
+
+        if a != "-":
+            i += 1
+        if b != "-":
+            j += 1
+
+    if len(rr) < MIN_ALIGNED_RESIDUES:
+        raise GCHSError(
+            f"Only {len(rr)} aligned residue pairs were obtained. "
+            f"At least {MIN_ALIGNED_RESIDUES} are required."
+        )
+
+    return rr, tr, rb, tb
+
+
+# ----------------------- SUPERPOSITION ----------------------------
+
+def superimpose(reference_structure, target_structure,
+                 ref_residues, tgt_residues, ref_b, tgt_b):
+
+    paired = [
+        (r, t, rb, tb)
+        for r, t, rb, tb in zip(ref_residues, tgt_residues, ref_b, tgt_b)
+        if "CA" in r and "CA" in t
+    ]
+
+    if len(paired) < MIN_ALIGNED_RESIDUES:
+        raise GCHSError(
+            f"Only {len(paired)} aligned residue pairs have resolved "
+            f"C-alpha atoms in both structures."
+        )
+
+    rr, tr, rb, tb = map(list, zip(*paired))
+
+    ref_atoms = [r["CA"] for r in rr]
+    tgt_atoms = [t["CA"] for t in tr]
+
+    sup = Superimposer()
+
+    try:
+        sup.set_atoms(ref_atoms, tgt_atoms)
+        sup.apply(target_structure[0].get_atoms())
+    except Exception as e:
+        raise GCHSError(f"Structural superposition failed: {e}")
+
+    print(f"Global C-alpha RMSD: {sup.rms:.3f} Å")
+
+    return rr, tr, rb, tb, sup.rms
+
+
+# ---------------- PER-RESIDUE DISPLACEMENT ------------------------
+
+def calculate_displacement(ref_residues, tgt_residues):
+    results = []
+
+    for r, t in zip(ref_residues, tgt_residues):
+        d = float(np.linalg.norm(
+            r["CA"].get_coord() - t["CA"].get_coord()
+        ))
+
+        results.append({
+            "Reference": r.get_id()[1],
+            "Target": t.get_id()[1],
+            "CAlpha": d
+        })
+
+    return results
+
+
+# ------------------------ ALIGNMENT I/O ---------------------------
+
+def print_alignment(ref, tgt, width=80):
+    print("\n--- Sequence Alignment ---")
+    for start in range(0, len(ref), width):
+        r = ref[start:start + width]
+        t = tgt[start:start + width]
+        m = "".join(
+            "|" if a == b and a != "-" else " "
+            for a, b in zip(r, t)
+        )
+        print(f"REF: {r}")
+        print(f"     {m}")
+        print(f"TGT: {t}\n")
+
+
+def save_alignment(ref, tgt, path, width=80):
+    with open(path, "w") as f:
+        for start in range(0, len(ref), width):
+            r = ref[start:start + width]
+            t = tgt[start:start + width]
+            m = "".join(
+                "|" if a == b and a != "-" else " "
+                for a, b in zip(r, t)
+            )
+            f.write(f"REF: {r}\n     {m}\nTGT: {t}\n\n")
+
+
+# ------------------------- SUMMARY --------------------------------
+
+def summary(results):
+    x = np.array([d["CAlpha"] for d in results], dtype=float)
+
+    print("\n--- Per-residue C-alpha Displacement ---")
+    print(f"Residues compared  : {len(x)}")
+    print(f"Mean               : {x.mean():.3f} Å")
+    print(f"Median             : {np.median(x):.3f} Å")
+    print(f"Std. deviation     : {x.std():.3f} Å")
+    print(f"Minimum / Maximum  : {x.min():.3f} / {x.max():.3f} Å")
+
+    top = sorted(results, key=lambda z: z["CAlpha"], reverse=True)[:5]
+    print("\nTop 5 most displaced aligned residues:")
+    for d in top:
+        print(
+            f"  Ref {d['Reference']:>5} -> "
+            f"Target {d['Target']:>5} : {d['CAlpha']:.3f} Å"
+        )
+    print("------------------------------------------\n")
+
+
+# ------------------------- EXCEL ---------------------------------
+
+def save_master_log(results, ref_b, tgt_b, path):
+    if not (len(results) == len(ref_b) == len(tgt_b)):
+        raise GCHSError("Internal mismatch between structural and B-factor data.")
+
+    df = pd.DataFrame({
+        "Aligned Reference Residue Number":
+            [d["Reference"] for d in results],
+        "Corresponding Aligned Target Residue Number":
+            [d["Target"] for d in results],
+        "Cα Displacement (Å)":
+            [d["CAlpha"] for d in results],
+        "Reference B-factor (all-atom average)": ref_b,
+        "Target B-factor (all-atom average)": tgt_b
+    })
+
+    try:
+        df.to_excel(path, index=False)
+    except Exception as e:
+        raise GCHSError(f"Could not write Master Log: {e}")
+
+    print(f"Master Log saved: {path}")
+
+
+# -------------------------- PLOTS --------------------------------
+
+def plot_displacement(results, path):
+    x = [d["Reference"] for d in results]
+    y = [d["CAlpha"] for d in results]
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(x, y, linewidth=1.2)
+    plt.scatter(x, y, s=12)
+    plt.xlabel("Reference Residue Number")
+    plt.ylabel("Cα Displacement (Å)")
+    plt.title("Per-residue Cα Displacement")
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"Cα displacement plot saved: {path}")
+
+
+def plot_bfactors(results, ref_b, tgt_b, path):
+    x = [d["Reference"] for d in results]
+
+    ref = np.asarray(ref_b, dtype=float)
+    tgt = np.asarray(tgt_b, dtype=float)
+
+    ref_mean = np.nanmean(ref) if not np.all(np.isnan(ref)) else np.nan
+    tgt_mean = np.nanmean(tgt) if not np.all(np.isnan(tgt)) else np.nan
+
+    plt.figure(figsize=(10, 5))
+
+    plt.plot(
+        x, ref,
+        label=f"Reference B-factor (mean = {ref_mean:.2f})"
+        if not np.isnan(ref_mean) else "Reference B-factor",
+        marker="o", markersize=3
+    )
+
+    plt.plot(
+        x, tgt,
+        label=f"Target B-factor (mean = {tgt_mean:.2f})"
+        if not np.isnan(tgt_mean) else "Target B-factor",
+        marker="s", markersize=3
+    )
+
+    if not np.isnan(ref_mean):
+        plt.axhline(ref_mean, linestyle=":", linewidth=1)
+
+    if not np.isnan(tgt_mean):
+        plt.axhline(tgt_mean, linestyle=":", linewidth=1)
+
+    plt.xlabel("Reference Residue Number")
+    plt.ylabel("B-factor")
+    plt.title("B-factor Trends of Reference and Target Structures")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+    print(f"B-factor plot saved: {path}")
+
+
+# ================================================================
+# 16. INTERACTIVE COLAB WORKFLOW
+# ================================================================
+
+print("=" * 72)
+print(f" GCHS v{GCHS_VERSION}")
+print(" General Executable Conformational Heterogeneity Scanner")
+print("=" * 72)
+print("\nGCHS compares two user-selected protein chains.")
+print("The biological context of the comparison is determined by the user.\n")
+
+try:
+    reference_pdb = upload_single_pdb(
+        "STEP 1 — Upload the REFERENCE PDB"
+    )
+
+    target_pdb = upload_single_pdb(
+        "STEP 2 — Upload the TARGET PDB"
+    )
+
+    reference_structure = parse_structure(
+        reference_pdb, "reference"
+    )
+
+    target_structure = parse_structure(
+        target_pdb, "target"
+    )
+
+    ref_chains = chain_ids(reference_structure)
+    tgt_chains = chain_ids(target_structure)
+
+    print(
+        f"\nReference PDB: {os.path.basename(reference_pdb)}"
+    )
+    print(
+        f"Available chains: {', '.join(ref_chains)}"
+    )
+
+    print(
+        f"\nTarget PDB: {os.path.basename(target_pdb)}"
+    )
+    print(
+        f"Available chains: {', '.join(tgt_chains)}\n"
+    )
+
+    ref_dropdown = widgets.Dropdown(
+        options=ref_chains,
+        value=ref_chains[0],
+        description="Reference chain:",
+        style={"description_width": "initial"},
+        layout=widgets.Layout(width="360px")
+    )
+
+    tgt_dropdown = widgets.Dropdown(
+        options=tgt_chains,
+        value=tgt_chains[0],
+        description="Target chain:",
+        style={"description_width": "initial"},
+        layout=widgets.Layout(width="360px")
+    )
+
+    run_button = widgets.Button(
+        description=f"Run GCHS v{GCHS_VERSION}",
+        button_style="success",
+        icon="play",
+        layout=widgets.Layout(width="220px")
+    )
+
+    output = widgets.Output()
+
+    display(widgets.VBox([
+        widgets.HTML(
+            "<h4>Select the protein chains to compare</h4>"
+        ),
+        ref_dropdown,
+        tgt_dropdown,
+        widgets.HTML(
+            "<i>GCHS does not infer biological chain equivalence. "
+            "Select the chains appropriate for your comparison.</i>"
+        ),
+        run_button,
+        output
+    ]))
+
+    def run_gchs(_):
+
+        with output:
+            clear_output()
+
+            ref_chain = ref_dropdown.value
+            tgt_chain = tgt_dropdown.value
+
+            print("=" * 72)
+            print("SELECTED GCHS COMPARISON")
+            print("=" * 72)
+
+            print(
+                f"Reference: {os.path.basename(reference_pdb)} "
+                f"| Chain {ref_chain}"
+            )
+            print(
+                f"Target   : {os.path.basename(target_pdb)} "
+                f"| Chain {tgt_chain}\n"
+            )
+
+            try:
+                ref_seq, ref_residues, ref_b = extract_chain_data(
+                    reference_structure, ref_chain, "reference"
+                )
+
+                tgt_seq, tgt_residues, tgt_b = extract_chain_data(
+                    target_structure, tgt_chain, "target"
+                )
+
+                print(f"Reference chain length: {len(ref_seq)}")
+                print(f"Target chain length   : {len(tgt_seq)}\n")
+
+                print("Aligning sequences (BLOSUM62 + affine gaps)...")
+
+                aligned_ref, aligned_tgt, identity = align_sequences(
+                    ref_seq, tgt_seq
+                )
+
+                print("Mapping aligned residues...")
+
+                rr, tr, rb, tb = map_residues(
+                    aligned_ref,
+                    aligned_tgt,
+                    ref_residues,
+                    tgt_residues,
+                    ref_b,
+                    tgt_b
+                )
+
+                print("Superimposing selected chains...")
+
+                rr, tr, rb, tb, global_rmsd = superimpose(
+                    reference_structure,
+                    target_structure,
+                    rr, tr, rb, tb
+                )
+
+                print("Calculating per-residue Cα displacement...")
+
+                results = calculate_displacement(rr, tr)
+
+                print_alignment(
+                    aligned_ref, aligned_tgt
+                )
+
+                summary(results)
+
+                ref_stem = safe_stem(reference_pdb)
+                tgt_stem = safe_stem(target_pdb)
+
+                prefix = (
+                    f"GCHS_{ref_stem}_{ref_chain}"
+                    f"_vs_{tgt_stem}_{tgt_chain}"
+                )
+
+                master_log = f"{prefix}_Master_Log.xlsx"
+                alignment_file = f"{prefix}_Alignment.txt"
+                displacement_plot = f"{prefix}_CAlpha_Displacement.png"
+                bfactor_plot = f"{prefix}_BFactors.png"
+
+                save_alignment(
+                    aligned_ref,
+                    aligned_tgt,
+                    alignment_file
+                )
+
+                save_master_log(
+                    results,
+                    rb,
+                    tb,
+                    master_log
+                )
+
+                plot_displacement(
+                    results,
+                    displacement_plot
+                )
+
+                plot_bfactors(
+                    results,
+                    rb,
+                    tb,
+                    bfactor_plot
+                )
+
+                print("=" * 72)
+                print("GCHS ANALYSIS COMPLETE")
+                print("=" * 72)
+
+                print(f"Reference chain   : {ref_chain}")
+                print(f"Target chain      : {tgt_chain}")
+                print(f"Sequence identity : {identity * 100:.2f}%")
+                print(f"Aligned residues  : {len(results)}")
+                print(f"Global Cα RMSD    : {global_rmsd:.3f} Å")
+
+                print("\nGenerated outputs:")
+                for f in [
+                    master_log,
+                    alignment_file,
+                    displacement_plot,
+                    bfactor_plot
+                ]:
+                    print(f"  • {f}")
+
+                print("\nDownloading outputs...")
+
+                for f in [
+                    master_log,
+                    alignment_file,
+                    displacement_plot,
+                    bfactor_plot
+                ]:
+                    files.download(f)
+
+                print("\nAll GCHS outputs generated successfully.")
+
+            except GCHSError as e:
+                print(f"\nGCHS Error: {e}")
+
+            except Exception as e:
+                print(
+                    f"\nUnexpected error: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    run_button.on_click(run_gchs)
+
+except GCHSError as e:
+    print(f"\nGCHS Error: {e}")
+
+except Exception as e:
+    print(
+        f"\nUnexpected setup error: "
+        f"{type(e).__name__}: {e}"
+    )
